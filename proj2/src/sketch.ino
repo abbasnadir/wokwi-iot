@@ -1,285 +1,307 @@
-/*
-  =====================================================
-  4-Way Intersection — Ambulance Priority + Countdowns
-  =====================================================
-  Ambulance direction : SOUTH
-  Normal cycle        : N → E → S → W (10s each)
+#include <PubSubClient.h>
+#include <WiFi.h>
 
-  STATES:
-    NORMAL         — cycling N→E→S→W, displays count down
-    AMBUL_WARNING  — ambulance detected, 5s countdown
-                     before South goes green
-    AMBUL_ACTIVE   — South green, others red + dashes
-    AMBUL_COOLDOWN — ambulance passed, 5s cooldown,
-                     then normal cycle resumes
+namespace {
 
-  ── SAFE PIN MAP (ESP32-C6) ──────────────────────────
-  Pot SIG        → 4   (ADC, safe for analog in)
+constexpr int POT_PIN = 4;
+constexpr int RESET_BUTTON_PIN = 8;
 
-  North  GREEN   → 1   RED → 2
-  East   GREEN   → 3   RED → 6
-  South  GREEN   → 7   RED → 10
-  West   GREEN   → 11  RED → 18
+constexpr int POSITION_MIN_METERS = -400;
+constexpr int POSITION_MAX_METERS = 400;
+constexpr int START_ZONE_METERS = 350;
+constexpr int MOVE_START_DELTA_METERS = 20;
+constexpr int READ_INTERVAL_MS = 100;
+constexpr int PUBLISH_INTERVAL_MS = 800;
 
-  TM1637 North   CLK → 19   DIO → 20
-  TM1637 East    CLK → 21   DIO → 22
-  TM1637 South   CLK → 23   DIO → 0
-  TM1637 West    CLK → 5    DIO → 15
-  (pins 5 & 15 are strapping but safe for output after boot)
-  =====================================================
-*/
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASSWORD = "";
+const char* MQTT_BROKER = "broker.emqx.io";
+const int MQTT_PORT = 1883;
+const char* MQTT_TOPIC = "iot/ambulance-priority/corridor";
 
-#include <TM1637Display.h>
+enum Side { SIDE_NONE = -1, SIDE_NORTH = 0, SIDE_SOUTH = 1 };
 
-// ─── POT ───────────────────────────────────────────
-#define POT_PIN          4
-const int NUM_SAMPLES  = 20;
-const int DEADBAND     = 30;
-const int ALERT_THRESHOLD = 2100;
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
-// ─── LED PINS ──────────────────────────────────────
-#define N_GREEN  1
-#define N_RED    2
-#define E_GREEN  3
-#define E_RED    6
-#define S_GREEN  7
-#define S_RED    10
-#define W_GREEN  11
-#define W_RED    18
+int currentAdc = 0;
+int rawPositionMeters = POSITION_MIN_METERS;
+int publishedPositionMeters = POSITION_MIN_METERS;
+int previousPublishedPositionMeters = POSITION_MIN_METERS;
+int resetReferencePositionMeters = POSITION_MIN_METERS;
+bool resetOverrideActive = true;
+bool lastButtonPressed = false;
 
-const int GREEN_PINS[4] = { N_GREEN, E_GREEN, S_GREEN, W_GREEN };
-const int RED_PINS[4]   = { N_RED,   E_RED,   S_RED,   W_RED   };
+bool tripActive = false;
+Side readySide = SIDE_NORTH;
+Side originSide = SIDE_NONE;
+Side targetSide = SIDE_NONE;
+String activeCode;
+unsigned long nextAmbulanceCode = 1;
+unsigned long lastSensorUpdateMs = 0;
+unsigned long lastPublishMs = 0;
+unsigned long lastSerialLogMs = 0;
+String pendingEvent = "reset";
 
-#define IDX_N 0
-#define IDX_E 1
-#define IDX_S 2
-#define IDX_W 3
-
-// ─── TM1637 DISPLAYS ───────────────────────────────
-//                    CLK  DIO
-TM1637Display dispN( 19,  20 );
-TM1637Display dispE( 21,  22 );
-TM1637Display dispS( 23,   0 );
-TM1637Display dispW(  5,  15 );
-
-TM1637Display* displays[4] = { &dispN, &dispE, &dispS, &dispW };
-const char*    DIR_NAMES[4] = { "NORTH", "EAST", "SOUTH", "WEST" };
-
-// ─── TIMING ────────────────────────────────────────
-const unsigned long NORMAL_PHASE_MS = 10000;
-const unsigned long WARNING_MS      =  5000;
-const unsigned long COOLDOWN_MS     =  5000;
-
-// ─── STATE MACHINE ─────────────────────────────────
-enum State { NORMAL, AMBUL_WARNING, AMBUL_ACTIVE, AMBUL_COOLDOWN };
-State state = NORMAL;
-
-int           normalPhase    = IDX_N;
-unsigned long phaseStartMs   = 0;
-unsigned long stateStartMs   = 0;
-int           lastStableADC  = -1;
-bool          ambulanceNear  = false;
-
-// ───────────────────────────────────────────────────
-
-int smoothRead(int pin) {
-  long sum = 0;
-  for (int i = 0; i < NUM_SAMPLES; i++) {
-    sum += analogRead(pin);
-    delay(1);
+const char* sideName(Side side) {
+  switch (side) {
+    case SIDE_NORTH:
+      return "north";
+    case SIDE_SOUTH:
+      return "south";
+    case SIDE_NONE:
+      return "none";
   }
-  return (int)(sum / NUM_SAMPLES);
+  return "none";
 }
 
-void setOnlyGreen(int idx) {
-  for (int i = 0; i < 4; i++) {
-    digitalWrite(GREEN_PINS[i], i == idx ? HIGH : LOW);
-    digitalWrite(RED_PINS[i],   i == idx ? LOW  : HIGH);
+const char* routeName(Side origin, Side target) {
+  if (origin == SIDE_NORTH && target == SIDE_SOUTH) return "north_to_south";
+  if (origin == SIDE_SOUTH && target == SIDE_NORTH) return "south_to_north";
+  return "idle";
+}
+
+int readStableAdc() {
+  long total = 0;
+  for (int i = 0; i < 8; ++i) {
+    total += analogRead(POT_PIN);
+    delay(2);
   }
+  return static_cast<int>(total / 8);
 }
 
-void allRed() {
-  for (int i = 0; i < 4; i++) {
-    digitalWrite(GREEN_PINS[i], LOW);
-    digitalWrite(RED_PINS[i],   HIGH);
+String makeCode() {
+  char buffer[20];
+  snprintf(buffer, sizeof(buffer), "AMB-%04lu", nextAmbulanceCode++);
+  return String(buffer);
+}
+
+void connectToWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
   }
+  Serial.println();
+  Serial.print("Connected. Node IP: ");
+  Serial.println(WiFi.localIP());
 }
 
-void showDashes(TM1637Display* d) {
-  uint8_t seg[] = { SEG_G, SEG_G, SEG_G, SEG_G };
-  d->setSegments(seg);
-}
-
-void showSeconds(TM1637Display* d, int secs) {
-  if (secs < 0) secs = 0;
-  d->showNumberDec(secs, false);
-}
-
-// ─── DISPLAY UPDATE ────────────────────────────────
-void updateDisplays() {
-  unsigned long now     = millis();
-  unsigned long elapsed = now - phaseStartMs;
-
-  switch (state) {
-
-    case NORMAL: {
-      unsigned long phaseLeft = 0;
-      if (elapsed < NORMAL_PHASE_MS)
-        phaseLeft = (NORMAL_PHASE_MS - elapsed) / 1000;
-
-      for (int i = 0; i < 4; i++) {
-        if (i == normalPhase) {
-          showSeconds(displays[i], (int)phaseLeft);
-        } else {
-          int phasesAway = (i - normalPhase + 4) % 4;
-          long waitSecs  = (long)phaseLeft + (long)(phasesAway - 1) * (NORMAL_PHASE_MS / 1000);
-          showSeconds(displays[i], (int)waitSecs);
-        }
-      }
-      break;
-    }
-
-    case AMBUL_WARNING: {
-      unsigned long warnElapsed = now - stateStartMs;
-      int secsLeft = (int)((WARNING_MS - warnElapsed) / 1000);
-      for (int i = 0; i < 4; i++) {
-        if (i == IDX_S) showSeconds(displays[i], secsLeft);
-        else            showDashes(displays[i]);
-      }
-      break;
-    }
-
-    case AMBUL_ACTIVE: {
-      for (int i = 0; i < 4; i++) {
-        if (i == IDX_S) showSeconds(displays[i], 0);
-        else            showDashes(displays[i]);
-      }
-      break;
-    }
-
-    case AMBUL_COOLDOWN: {
-      unsigned long cdElapsed = now - stateStartMs;
-      int secsLeft = (int)((COOLDOWN_MS - cdElapsed) / 1000);
-      for (int i = 0; i < 4; i++) {
-        if (i == IDX_S) showSeconds(displays[i], secsLeft);
-        else            showDashes(displays[i]);
-      }
-      break;
+void ensureMqttConnection() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT broker...");
+    char clientId[40];
+    snprintf(clientId, sizeof(clientId), "proj2-corridor-%08lx", (unsigned long)ESP.getEfuseMac());
+    if (mqttClient.connect(clientId)) {
+      Serial.println("connected");
+      Serial.print("Publishing corridor data to topic: ");
+      Serial.println(MQTT_TOPIC);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" retrying in 2s");
+      delay(2000);
     }
   }
 }
 
-// ───────────────────────────────────────────────────
+void resetSimulationToNorth() {
+  resetOverrideActive = true;
+  resetReferencePositionMeters = rawPositionMeters;
+  publishedPositionMeters = POSITION_MIN_METERS;
+  previousPublishedPositionMeters = POSITION_MIN_METERS;
+  readySide = SIDE_NORTH;
+  tripActive = false;
+  originSide = SIDE_NONE;
+  targetSide = SIDE_NONE;
+  activeCode = "";
+  pendingEvent = "reset";
+
+  Serial.println("Reset button pressed. Published position forced to 400m north of the center.");
+}
+
+void startTrip(Side origin, Side target) {
+  tripActive = true;
+  originSide = origin;
+  targetSide = target;
+  activeCode = makeCode();
+  pendingEvent = "trip_started";
+
+  Serial.print("New ambulance trip -> code=");
+  Serial.print(activeCode);
+  Serial.print(", route=");
+  Serial.println(routeName(originSide, targetSide));
+}
+
+void updateReadySide() {
+  if (publishedPositionMeters <= -START_ZONE_METERS) {
+    readySide = SIDE_NORTH;
+  } else if (publishedPositionMeters >= START_ZONE_METERS) {
+    readySide = SIDE_SOUTH;
+  }
+}
+
+void maybeStartTrip() {
+  if (tripActive) {
+    return;
+  }
+
+  if (readySide == SIDE_NORTH &&
+      previousPublishedPositionMeters <= -START_ZONE_METERS &&
+      publishedPositionMeters > previousPublishedPositionMeters + MOVE_START_DELTA_METERS) {
+    startTrip(SIDE_NORTH, SIDE_SOUTH);
+    return;
+  }
+
+  if (readySide == SIDE_SOUTH &&
+      previousPublishedPositionMeters >= START_ZONE_METERS &&
+      publishedPositionMeters < previousPublishedPositionMeters - MOVE_START_DELTA_METERS) {
+    startTrip(SIDE_SOUTH, SIDE_NORTH);
+  }
+}
+
+void maybeCompleteTrip() {
+  if (!tripActive) {
+    return;
+  }
+
+  if (targetSide == SIDE_SOUTH && publishedPositionMeters >= START_ZONE_METERS) {
+    pendingEvent = "completed";
+    readySide = SIDE_SOUTH;
+    tripActive = false;
+    Serial.print("Ambulance completed route at south node -> ");
+    Serial.println(activeCode);
+    return;
+  }
+
+  if (targetSide == SIDE_NORTH && publishedPositionMeters <= -START_ZONE_METERS) {
+    pendingEvent = "completed";
+    readySide = SIDE_NORTH;
+    tripActive = false;
+    Serial.print("Ambulance completed route at north node -> ");
+    Serial.println(activeCode);
+  }
+}
+
+void refreshCorridorPosition(bool forceLog = false) {
+  const unsigned long now = millis();
+  if (!forceLog && now - lastSensorUpdateMs < READ_INTERVAL_MS) {
+    return;
+  }
+
+  lastSensorUpdateMs = now;
+  currentAdc = readStableAdc();
+  rawPositionMeters = map(currentAdc, 0, 4095, POSITION_MIN_METERS, POSITION_MAX_METERS);
+  rawPositionMeters = constrain(rawPositionMeters, POSITION_MIN_METERS, POSITION_MAX_METERS);
+
+  const bool buttonPressed = digitalRead(RESET_BUTTON_PIN) == LOW;
+  if (buttonPressed && !lastButtonPressed) {
+    resetSimulationToNorth();
+  }
+  lastButtonPressed = buttonPressed;
+
+  if (resetOverrideActive && abs(rawPositionMeters - resetReferencePositionMeters) > MOVE_START_DELTA_METERS) {
+    resetOverrideActive = false;
+    pendingEvent = "override_released";
+    Serial.println("Slider moved after reset. Releasing north-side override.");
+  }
+
+  previousPublishedPositionMeters = publishedPositionMeters;
+  publishedPositionMeters = resetOverrideActive ? POSITION_MIN_METERS : rawPositionMeters;
+
+  updateReadySide();
+  maybeStartTrip();
+  maybeCompleteTrip();
+
+  if (forceLog || now - lastSerialLogMs >= 1000) {
+    lastSerialLogMs = now;
+    Serial.print("Position update -> raw=");
+    Serial.print(rawPositionMeters);
+    Serial.print("m, published=");
+    Serial.print(publishedPositionMeters);
+    Serial.print("m, code=");
+    Serial.println(activeCode.length() ? activeCode : "none");
+  }
+}
+
+String buildJsonPayload(const String& eventName) {
+  String payload = "{";
+  payload += "\"code\":\"";
+  payload += activeCode;
+  payload += "\",\"event\":\"";
+  payload += eventName;
+  payload += "\",\"origin\":\"";
+  payload += sideName(originSide);
+  payload += "\",\"target\":\"";
+  payload += sideName(targetSide);
+  payload += "\",\"route\":\"";
+  payload += routeName(originSide, targetSide);
+  payload += "\",\"position_m\":";
+  payload += publishedPositionMeters;
+  payload += ",\"abs_distance_m\":";
+  payload += abs(publishedPositionMeters);
+  payload += ",\"adc\":";
+  payload += currentAdc;
+  payload += ",\"updated_at_ms\":";
+  payload += lastSensorUpdateMs;
+  payload += "}";
+  return payload;
+}
+
+void publishTelemetry() {
+  const unsigned long now = millis();
+  const bool hasPendingEvent = pendingEvent.length() > 0;
+  if (!hasPendingEvent && now - lastPublishMs < PUBLISH_INTERVAL_MS) {
+    return;
+  }
+
+  lastPublishMs = now;
+  refreshCorridorPosition();
+  ensureMqttConnection();
+
+  const String eventName = hasPendingEvent ? pendingEvent : "update";
+  const String payload = buildJsonPayload(eventName);
+  mqttClient.publish(MQTT_TOPIC, payload.c_str(), false);
+
+  Serial.print("Published -> ");
+  Serial.println(payload);
+
+  if (eventName == "completed") {
+    activeCode = "";
+    originSide = SIDE_NONE;
+    targetSide = SIDE_NONE;
+  }
+  pendingEvent = "";
+}
+
+}  // namespace
 
 void setup() {
   Serial.begin(115200);
-
-  for (int i = 0; i < 4; i++) {
-    pinMode(GREEN_PINS[i], OUTPUT);
-    pinMode(RED_PINS[i],   OUTPUT);
-  }
-
-  for (int i = 0; i < 4; i++) {
-    displays[i]->setBrightness(5);
-    showDashes(displays[i]);
-  }
-
-  allRed();
   delay(500);
 
-  phaseStartMs = millis();
-  setOnlyGreen(IDX_N);
-  state = NORMAL;
+  pinMode(POT_PIN, INPUT);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  analogReadResolution(12);
 
-  Serial.println("=== 4-Way Intersection — Ambulance from SOUTH ===");
-  Serial.println("Pot RIGHT → ambulance <100m approaching");
-  Serial.println("Pot LEFT  → normal cycle N→E→S→W (10s each)");
-  Serial.println("-------------------------------------------------");
-  Serial.println("[NORMAL] NORTH GREEN");
+  connectToWifi();
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  refreshCorridorPosition(true);
+
+  Serial.println("=== Ambulance Corridor Publisher ===");
+  Serial.println("Slider start  -> 400m north of center");
+  Serial.println("Slider middle -> 0m at center");
+  Serial.println("Slider full   -> 400m south of center");
+  Serial.println("Press reset to force the published position back to the north side.");
 }
 
-// ───────────────────────────────────────────────────
-
 void loop() {
-  unsigned long now = millis();
-
-  // ── Potentiometer read ─────────────────────────
-  int adc = smoothRead(POT_PIN);
-  if (abs(adc - lastStableADC) > DEADBAND) {
-    lastStableADC = adc;
-    bool newAmbul = (adc >= ALERT_THRESHOLD);
-    int  dist     = constrain(map(adc, 0, 4095, 200, 0), 0, 200);
-
-    if (newAmbul != ambulanceNear) {
-      ambulanceNear = newAmbul;
-      Serial.print("ADC: ");   Serial.print(adc);
-      Serial.print("  dist: ~"); Serial.print(dist);
-      Serial.println(ambulanceNear
-        ? "m  → 🚨 AMBULANCE DETECTED"
-        : "m  → 🟢 Ambulance cleared");
-    }
-  }
-
-  // ── State machine ──────────────────────────────
-  switch (state) {
-
-    case NORMAL:
-      if (now - phaseStartMs >= NORMAL_PHASE_MS) {
-        normalPhase  = (normalPhase + 1) % 4;
-        phaseStartMs = now;
-        setOnlyGreen(normalPhase);
-        Serial.print("[NORMAL] "); Serial.print(DIR_NAMES[normalPhase]); Serial.println(" GREEN");
-      }
-      if (ambulanceNear) {
-        Serial.println("[WARNING] Ambulance <100m — South green in 5s...");
-        allRed();
-        state        = AMBUL_WARNING;
-        stateStartMs = now;
-      }
-      break;
-
-    case AMBUL_WARNING:
-      if (!ambulanceNear) {
-        Serial.println("[NORMAL] Ambulance retreated — resuming");
-        state        = NORMAL;
-        phaseStartMs = now;
-        setOnlyGreen(normalPhase);
-        break;
-      }
-      if (now - stateStartMs >= WARNING_MS) {
-        Serial.println("[AMBUL] SOUTH GREEN — ambulance crossing!");
-        setOnlyGreen(IDX_S);
-        state        = AMBUL_ACTIVE;
-        stateStartMs = now;
-      }
-      break;
-
-    case AMBUL_ACTIVE:
-      if (!ambulanceNear) {
-        Serial.println("[COOLDOWN] Ambulance passed — 5s cooldown...");
-        allRed();
-        state        = AMBUL_COOLDOWN;
-        stateStartMs = now;
-      }
-      break;
-
-    case AMBUL_COOLDOWN:
-      if (ambulanceNear) {
-        Serial.println("[WARNING] Ambulance back — restarting warning");
-        state        = AMBUL_WARNING;
-        stateStartMs = now;
-        break;
-      }
-      if (now - stateStartMs >= COOLDOWN_MS) {
-        normalPhase  = (IDX_S + 1) % 4;
-        phaseStartMs = now;
-        setOnlyGreen(normalPhase);
-        state        = NORMAL;
-        Serial.print("[NORMAL] Resuming → "); Serial.print(DIR_NAMES[normalPhase]); Serial.println(" GREEN");
-      }
-      break;
-  }
-
-  updateDisplays();
-  delay(50);
+  refreshCorridorPosition();
+  ensureMqttConnection();
+  mqttClient.loop();
+  publishTelemetry();
+  delay(10);
 }

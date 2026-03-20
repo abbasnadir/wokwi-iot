@@ -1,5 +1,4 @@
 # Wokwi Library List
 # See https://docs.wokwi.com/guides/libraries
 
-MFRC522
 TM1637

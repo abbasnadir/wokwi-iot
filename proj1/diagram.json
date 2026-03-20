@@ -5,13 +5,6 @@
   "parts": [
     { "type": "board-esp32-c6-devkitc-1", "id": "esp", "top": 200, "left": 0, "attrs": {} },
     {
-      "type": "wokwi-slide-potentiometer",
-      "id": "pot1",
-      "top": 220,
-      "left": -300,
-      "attrs": { "travelLength": "30" }
-    },
-    {
       "type": "wokwi-tm1637-7segment",
       "id": "seg_n",
       "top": -220,
@@ -137,9 +130,6 @@
   "connections": [
     [ "esp:TX", "$serialMonitor:RX", "", [] ],
     [ "esp:RX", "$serialMonitor:TX", "", [] ],
-    [ "pot1:VCC", "esp:3V3", "red", [ "v0" ] ],
-    [ "pot1:GND", "esp:GND.1", "black", [ "v0" ] ],
-    [ "pot1:SIG", "esp:4", "green", [ "v0" ] ],
     [ "seg_n:CLK", "esp:19", "cyan", [ "v20", "h0" ] ],
     [ "seg_n:DIO", "esp:20", "orange", [ "v30", "h0" ] ],
     [ "seg_n:VCC", "esp:3V3", "red", [ "v40", "h0" ] ],
